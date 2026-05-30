@@ -1038,6 +1038,7 @@ var ClaudeAdapter = class {
     });
   }
   run(opts) {
+    opts = { ...opts, cwd: normalizeCwd(opts.cwd) };
     const images = Array.isArray(opts.images) ? opts.images : [];
     const useMultimodalInput = images.length > 0;
     const args = [
@@ -2921,9 +2922,22 @@ import { createReadStream } from "fs";
 import { readdir as readdir3, stat as stat3 } from "fs/promises";
 import { homedir as homedir3 } from "os";
 import { join as join5 } from "path";
+import { win32 as pathWin32 } from "path";
 import { createInterface as createInterface3 } from "readline";
+function normalizeCwd(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0) return cwd;
+  if (process.platform !== "win32") return cwd;
+  let r;
+  try {
+    r = pathWin32.resolve(cwd);
+  } catch {
+    r = cwd.replace(/\//g, "\\").replace(/\\+$/, "");
+  }
+  if (/^[A-Z]:/.test(r)) r = r.charAt(0).toLowerCase() + r.slice(1);
+  return r;
+}
 function encodeCwd(cwd) {
-  return cwd.replace(/\//g, "-");
+  return cwd.replace(/[\\/]/g, "-");
 }
 function claudeProjectDir(cwd) {
   return join5(homedir3(), ".claude", "projects", encodeCwd(cwd));
@@ -3206,7 +3220,7 @@ async function handleCd(args, ctx) {
     await reply(ctx, "\u7528\u6CD5\uFF1A`/cd <\u7EDD\u5BF9\u8DEF\u5F84>` \u6216 `/cd ~/xxx`");
     return;
   }
-  if (!input.startsWith("/") && !input.startsWith("~")) {
+  if (!input.startsWith("/") && !input.startsWith("~") && !/^[A-Za-z]:[\\\/]/.test(input)) {
     await reply(ctx, "\u8BF7\u4F7F\u7528\u7EDD\u5BF9\u8DEF\u5F84\uFF0C\u6216 `~/xxx` \u8868\u793A home \u4E0B\u7684\u5B50\u8DEF\u5F84\u3002");
     return;
   }
@@ -3329,7 +3343,7 @@ async function handleStatus(_args, ctx) {
   const card = statusCard({
     cwd,
     sessionId: sess?.sessionId,
-    sessionStale: Boolean(sess && sess.cwd !== cwd),
+    sessionStale: Boolean(sess && normalizeCwd(sess.cwd) !== normalizeCwd(cwd)),
     agentName: ctx.agent.displayName,
     scope: ctx.scope,
     chatMode: ctx.chatMode
@@ -5086,7 +5100,8 @@ async function startChannel(deps) {
     // the normalizer drops (e.g. action.form_value on CardKit 2.0 form submits).
     includeRawEvent: true,
     outbound: {
-      streamThrottleMs: 400
+      streamThrottleMs: 400,
+      streamMaxElementChars: 1e5
     },
     // SDK 1.65.0-alpha.3+ knobs.
     wsConfig: {
@@ -5346,7 +5361,7 @@ async function runAgentBatch(deps) {
     log.info("session", "resume", { sessionId: resumeFrom, cwd });
   } else {
     const stale = sessions.getRaw(scope);
-    if (stale && stale.cwd !== cwd) {
+    if (stale && normalizeCwd(stale.cwd) !== normalizeCwd(cwd)) {
       log.info("session", "stale-cleared", { staleCwd: stale.cwd, newCwd: cwd });
       sessions.clear(scope);
     } else {
@@ -5378,33 +5393,62 @@ async function runAgentBatch(deps) {
   };
   const reactionId = replyMode === "card" ? void 0 : await addWorkingReaction(channel, lastMsg.messageId);
   try {
+    let streamFailed = false;
+    let lastStreamedState = initialState;
     if (replyMode === "card") {
-      await channel.stream(
-        chatId,
-        {
-          card: {
-            initial: renderCard(initialState),
-            producer: async (ctrl) => {
+      let cardMsgId;
+      try {
+        const result = await channel.stream(
+          chatId,
+          {
+            card: {
+              initial: renderCard(initialState),
+              producer: async (ctrl) => {
+                await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
+                  lastStreamedState = state;
+                  await ctrl.update(renderCard(filterForPrefs(state)));
+                });
+              }
+            }
+          },
+          sendOpts
+        );
+        cardMsgId = result?.messageId;
+      } catch (streamErr) {
+        streamFailed = true;
+        log.warn("stream", "card-stream-failed", { error: String(streamErr) });
+      }
+      if (!streamFailed && cardMsgId && lastStreamedState.terminal !== "running") {
+        await new Promise((r) => setTimeout(r, 600));
+        try {
+          const finalCard = renderCard(filterForPrefs(lastStreamedState));
+          await channel.rawClient.im.v1.message.patch({
+            path: { message_id: cardMsgId },
+            data: { content: JSON.stringify(finalCard) }
+          });
+          log.info("stream", "card-final-double-push");
+        } catch (doublePushErr) {
+          log.warn("stream", "card-double-push-failed", { error: String(doublePushErr) });
+        }
+      }
+    } else if (replyMode === "markdown") {
+      try {
+        await channel.stream(
+          chatId,
+          {
+            markdown: async (ctrl) => {
               await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-                await ctrl.update(renderCard(filterForPrefs(state)));
+                lastStreamedState = state;
+                await ctrl.setContent(renderText(filterForPrefs(state)));
               });
             }
-          }
-        },
-        sendOpts
-      );
-    } else if (replyMode === "markdown") {
-      await channel.stream(
-        chatId,
-        {
-          markdown: async (ctrl) => {
-            await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
-              await ctrl.setContent(renderText(filterForPrefs(state)));
-            });
-          }
-        },
-        sendOpts
-      );
+          },
+          sendOpts
+        );
+      } catch (streamErr) {
+        streamFailed = true;
+        log.warn("stream", "markdown-stream-failed", { error: String(streamErr) });
+      }
     } else {
       let finalState = initialState;
       await processAgentStream(handle, sessions, scope, cwd, idleTimeoutMs, async (state) => {
@@ -5413,6 +5457,17 @@ async function runAgentBatch(deps) {
       const body = renderText(filterForPrefs(finalState));
       if (body.trim()) {
         await channel.send(chatId, { markdown: body }, sendOpts);
+      }
+    }
+    if (streamFailed && lastStreamedState.terminal !== "running") {
+      const fallback = renderText(filterForPrefs(lastStreamedState));
+      if (fallback.trim()) {
+        try {
+          await channel.send(chatId, { markdown: fallback }, sendOpts);
+          log.info("stream", "fallback-sent");
+        } catch (fallbackErr) {
+          log.warn("stream", "fallback-failed", { error: String(fallbackErr) });
+        }
       }
     }
   } catch (err) {
@@ -5682,7 +5737,7 @@ var SessionStore = class {
   resumeFor(chatId, cwd) {
     const entry = this.data[chatId];
     if (!entry) return void 0;
-    if (entry.cwd !== cwd) return void 0;
+    if (normalizeCwd(entry.cwd) !== normalizeCwd(cwd)) return void 0;
     return entry.sessionId;
   }
   getRaw(chatId) {
@@ -5692,7 +5747,7 @@ var SessionStore = class {
     const prev = this.data[chatId];
     this.data[chatId] = {
       sessionId,
-      cwd,
+      cwd: normalizeCwd(cwd),
       updatedAt: Date.now(),
       ...prev?.idleTimeoutMinutes !== void 0 ? { idleTimeoutMinutes: prev.idleTimeoutMinutes } : {}
     };
@@ -5765,20 +5820,26 @@ var WorkspaceStore = class {
     }
   }
   cwdFor(chatId) {
-    return this.data.chats[chatId]?.cwd;
+    const v = this.data.chats[chatId]?.cwd;
+    return v === void 0 ? v : normalizeCwd(v);
   }
   setCwd(chatId, cwd) {
-    this.data.chats[chatId] = { cwd };
+    this.data.chats[chatId] = { cwd: normalizeCwd(cwd) };
     this.schedulePersist();
   }
   listNamed() {
-    return { ...this.data.named };
+    const out = {};
+    for (const [k, v] of Object.entries(this.data.named)) {
+      out[k] = typeof v === "string" ? normalizeCwd(v) : v;
+    }
+    return out;
   }
   getNamed(name) {
-    return this.data.named[name];
+    const v = this.data.named[name];
+    return v === void 0 ? v : normalizeCwd(v);
   }
   saveNamed(name, cwd) {
-    this.data.named[name] = cwd;
+    this.data.named[name] = normalizeCwd(cwd);
     this.schedulePersist();
   }
   removeNamed(name) {
