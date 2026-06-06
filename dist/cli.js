@@ -1032,7 +1032,7 @@ var ClaudeAdapter = class {
   }
   async isAvailable() {
     return new Promise((resolve) => {
-      const child = spawn(this.binary, ["--version"], { stdio: "ignore" });
+      const child = spawn(this.binary, ["--version"], { stdio: "ignore", windowsHide: true });
       child.on("error", () => resolve(false));
       child.on("exit", (code) => resolve(code === 0));
     });
@@ -1061,7 +1061,8 @@ var ClaudeAdapter = class {
     const child = spawn(this.binary, args, {
       cwd: opts.cwd,
       env: { ...process.env, LARK_CHANNEL: "1" },
-      stdio: [useMultimodalInput ? "pipe" : "ignore", "pipe", "pipe"]
+      stdio: [useMultimodalInput ? "pipe" : "ignore", "pipe", "pipe"],
+      windowsHide: true
     });
     if (useMultimodalInput) {
       const content = [];
@@ -4156,7 +4157,8 @@ async function spawnExecProvider(pc, ref) {
     if (pc.env) Object.assign(env, pc.env);
     const child = spawn3(pc.command, pc.args ?? [], {
       env,
-      stdio: ["pipe", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
     });
     let stdout = "";
     let stderr = "";
