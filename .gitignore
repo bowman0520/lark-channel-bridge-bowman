@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+
+# Build output backups
+# 注意：dist/cli.js 本身是要入库的（这个仓的核心就是补丁版 cli.js），
+# 只忽略带时间戳的备份。
+dist/*.bak-*
+dist/*.bak
+
+# Local debug images (调试多模态输入用的样本图)
+image*.jpg
+user_image.jpg
